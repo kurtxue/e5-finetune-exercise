@@ -14,6 +14,7 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
 import matplotlib.pyplot as plt
+from collections import defaultdict
 
 class MyDataset(Dataset):
     def __init__(self, data):
@@ -33,6 +34,10 @@ def load_data(path, batch_size=32):
     
     corpus = pd.read_json(path+'corpus.jsonl', lines=True).reset_index(drop=True)
     queries = pd.read_json(path+'queries.jsonl', lines=True).reset_index(drop=True)
+    
+    pair = defaultdict(list)
+    for query_id, corpus_id in zip(positive_samples['query-id'], positive_samples['corpus-id']):
+        pair[query_id].append(corpus_id)
     
     corpus_id_to_index = {corpus_id: index for index, corpus_id in enumerate(corpus['_id'])}
     index_to_corpus_id = {index: corpus_id for index, corpus_id in enumerate(corpus['_id'])}
@@ -59,7 +64,7 @@ def load_data(path, batch_size=32):
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    return dataset, positive_samples, train_loader, val_loader, test_loader, query_id_to_index, corpus_id_to_index, train_data, val_data, test_data
+    return dataset, positive_samples, train_loader, val_loader, test_loader, query_id_to_index, corpus_id_to_index, train_data, val_data, test_data, pair
 
 def tokenize_data(data, tokenizer, device):
     embeddings = tokenizer(data, max_length=512, padding=True, truncation=True, return_tensors='pt').to(device)
@@ -110,7 +115,7 @@ def average_pool(last_hidden_states: Tensor,
     return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
 
 
-def train(model, tokenizer, data, train_loader, val_loader, train_data, val_data, num_epochs, learning_rate, patience, query_id_to_index, corpus_id_to_index, device):
+def train(model, tokenizer, data, train_loader, val_loader, train_data, val_data, num_epochs, learning_rate, patience, pairs, device):
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     train_loss, train_acc, val_loss, val_acc = [], [], [], []
@@ -138,10 +143,10 @@ def train(model, tokenizer, data, train_loader, val_loader, train_data, val_data
             optimizer.step()
         
         avg_loss = total_loss / len(train_loader)
-        t_acc = accuracy(train_data, model, tokenizer, query_id_to_index, corpus_id_to_index, device)
+        t_acc = accuracy(train_data, model, tokenizer, pairs, device)
         train_loss.append(float(avg_loss))
         train_acc.append(float(t_acc))
-        v_loss, v_acc = evaluate(model, val_loader, val_data, query_id_to_index, corpus_id_to_index, device)
+        v_loss, v_acc = evaluate(model, val_loader, val_data, pairs, device)
         val_loss.append(float(v_loss))
         val_acc.append(float(v_acc))
         print(f'End of Epoch {epoch}, Training Loss: {avg_loss}, Training Accuracy: {t_acc}, Validation Loss: {v_loss}, Validation Accuracy: {v_acc}')
@@ -161,7 +166,7 @@ def train(model, tokenizer, data, train_loader, val_loader, train_data, val_data
     return train_loss, train_acc, val_loss, val_acc
 
 
-def evaluate(model, test_loader, test_data, query_id_to_index, corpus_id_to_index, device):
+def evaluate(model, test_loader, test_data, pairs, device):
     model.eval()
     test_loss = 0
     with torch.no_grad():
@@ -180,7 +185,7 @@ def evaluate(model, test_loader, test_data, query_id_to_index, corpus_id_to_inde
             loss = compute_loss(scores_matrix, positive_index, negative_index)
             test_loss += loss.item()
     avg_loss = test_loss / len(test_loader)
-    acc = accuracy(test_data, model, tokenizer, query_id_to_index, corpus_id_to_index, device)
+    acc = accuracy(test_data, model, tokenizer, pairs, device)
     
     return avg_loss, acc
 
@@ -217,12 +222,12 @@ def compute_loss(scores_matrix, positive_index, negative_index):
     return avg_loss
     
     
-def accuracy(data, model, tokenizer, query_id_to_index, corpus_id_to_index, device):
+def accuracy(data, model, tokenizer, pairs, device):
     encode_embeddings = []
     batch_size = 64
     total_score = 0
     query_list = data['query_id']
-    corpus = list(set(data['corpus']))
+    corpus = data['corpus']
     for i in range(0, len(data['query']), batch_size):
         queries = data['query'][i:i+batch_size]
         n_queries = len(queries)
@@ -237,19 +242,20 @@ def accuracy(data, model, tokenizer, query_id_to_index, corpus_id_to_index, devi
     embeddings = torch.cat(encode_embeddings, dim=0)
     assert embeddings.shape[0] == len(queries) + len(corpus)
     scores_matrix = (embeddings[:n_queries] @ embeddings[n_queries:].T) * 100
+    
+    top_scores, top_indices = torch.topk(scores_matrix, 10, dim=1, largest=True, sorted=True)
+    
+
+    for i , query in enumerate(query_list):
         
-    for query in query_list:
-        query_index = query_id_to_index[query]
-        df = pd.DataFrame(data)
-        true_related = df[df['query_id'] == query]
+        true_related = pairs[query]
         predicted_top10_scores = []
-        predicted_top10_indices = torch.argsort(scores_matrix[query_index], descending=True)[:10]
-        for index in predicted_top10_indices:
-            if index in true_related['corpus_id']:
+        for index in top_indices[i]:
+            if corpus[index] in true_related:
                 predicted_top10_scores.append(1)
             else:
                 predicted_top10_scores.append(0)
-        true_top10_score = [1] * true_related.shape[0] + [0] * 10 
+        true_top10_score = [1] * len(true_related) + [0] * 10
         true_top10_score = true_top10_score[:10]
         dcg = np.sum( (2 ** predicted_top10_scores - 1) / np.log2(np.arange(2, 12)))
         idcg = np.sum( (2 ** true_top10_score - 1) / np.log2(np.arange(2, 12)))
@@ -299,7 +305,7 @@ if __name__ == '__main__':
     
     
     data_path = 'Data/'
-    dataset, positive_samples, train_loader, val_loader, test_loader, query_id_to_index, corpus_id_to_index, train_data, val_data, test_data = load_data(data_path, batch_size)
+    dataset, positive_samples, train_loader, val_loader, test_loader, query_id_to_index, corpus_id_to_index, train_data, val_data, test_data, pairs = load_data(data_path, batch_size)
     
     tokenizer = AutoTokenizer.from_pretrained('intfloat/e5-base-v2')
     model = AutoModel.from_pretrained('intfloat/e5-base-v2')
@@ -308,13 +314,13 @@ if __name__ == '__main__':
     
     print("Starting Training")
     
-    train_loss, train_acc, val_loss, val_acc = train(model, tokenizer, dataset, train_loader, val_loader, train_data, val_data, epochs, learning_rate, 10, query_id_to_index, corpus_id_to_index, device)
+    train_loss, train_acc, val_loss, val_acc = train(model, tokenizer, dataset, train_loader, val_loader, train_data, val_data, epochs, learning_rate, 10, pairs, device)
     
     plot_loss(train_loss, train_acc, val_loss, val_acc)
     
     print("Starting Evaluation")
     
-    loss, acc = evaluate(model, test_loader, test_data, query_id_to_index, corpus_id_to_index, device)
+    loss, acc = evaluate(model, test_loader, test_data, pairs, device)
     
     print(f"Average Test Loss: {loss}, Test Accuracy: {acc}")
     
