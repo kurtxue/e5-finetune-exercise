@@ -149,7 +149,7 @@ def train(model, tokenizer, data, train_loader, val_loader, train_data, val_data
         v_loss, v_acc = evaluate(model, val_loader, val_data, pairs, device)
         val_loss.append(float(v_loss))
         val_acc.append(float(v_acc))
-        print(f'End of Epoch {epoch}, Training Loss: {avg_loss}, Training Accuracy: {t_acc}, Validation Loss: {v_loss}, Validation Accuracy: {v_acc}')
+        print(f'End of Epoch {epoch}, Training Loss: {avg_loss}, Validation Loss: {v_loss}, Validation Accuracy: {v_acc}')
 
         if v_loss < best_val_loss:
             best_val_loss = v_loss
@@ -223,45 +223,50 @@ def compute_loss(scores_matrix, positive_index, negative_index):
     
     
 def accuracy(data, model, tokenizer, pairs, device):
-    encode_embeddings = []
-    batch_size = 64
-    total_score = 0
-    query_list = data['query_id']
-    corpus = data['corpus']
-    for i in range(0, len(data['query']), batch_size):
-        queries = data['query'][i:i+batch_size]
-        n_queries = len(queries)
-        inputs = prepend_prefix_2({'query': queries, 'corpus': data['corpus'][i:i+batch_size]})
-        inputs = tokenize_data(inputs, tokenizer, device)
-        inputs_ids = inputs['input_ids']
-        attention_mask = inputs['attention_mask']
-        outputs = model(inputs_ids)
-        embeddings = average_pool(outputs.last_hidden_state, attention_mask)
-        embeddings = F.normalize(embeddings, p=2, dim=1)
-        encode_embeddings.append(embeddings)
-    embeddings = torch.cat(encode_embeddings, dim=0)
-    assert embeddings.shape[0] == len(queries) + len(corpus)
-    scores_matrix = (embeddings[:n_queries] @ embeddings[n_queries:].T) * 100
-    
-    top_scores, top_indices = torch.topk(scores_matrix, 10, dim=1, largest=True, sorted=True)
-    
+    with torch.no_grad():
+        model.eval()
+        encode_embeddings = []
+        batch_size = 64
+        total_score = 0
+        query_list = data['query_id']
+        corpus = data['corpus']
+        n_queries = len(query_list)
+        for i in range(0, len(data['query']), batch_size):
+            queries = data['query'][i:i+batch_size]
+            
+            inputs = prepend_prefix_2({'query': queries, 'corpus': data['corpus'][i:i+batch_size]})
+            inputs = tokenize_data(inputs, tokenizer, device)
+            inputs_ids = inputs['input_ids']
+            attention_mask = inputs['attention_mask']
+            with torch.cuda.amp.autocast():
+                outputs = model(inputs_ids)
+                embeddings = average_pool(outputs.last_hidden_state, attention_mask)
+                embeddings = F.normalize(embeddings, p=2, dim=1)
+                encode_embeddings.append(embeddings)
 
-    for i , query in enumerate(query_list):
+        embeddings = torch.cat(encode_embeddings, dim=0)
+        scores_matrix = (embeddings[:n_queries] @ embeddings[n_queries:].T) * 100
         
-        true_related = pairs[query]
-        predicted_top10_scores = []
-        for index in top_indices[i]:
-            if corpus[index] in true_related:
-                predicted_top10_scores.append(1)
-            else:
-                predicted_top10_scores.append(0)
-        true_top10_score = [1] * len(true_related) + [0] * 10
-        true_top10_score = true_top10_score[:10]
-        dcg = np.sum( (2 ** predicted_top10_scores - 1) / np.log2(np.arange(2, 12)))
-        idcg = np.sum( (2 ** true_top10_score - 1) / np.log2(np.arange(2, 12)))
-        ndcg = dcg / idcg
-        total_score += ndcg
-    score = total_score / len(queries)
+        top_scores, top_indices = torch.topk(scores_matrix, 10, dim=1, largest=True, sorted=True)
+ 
+        for i , query in enumerate(query_list):
+            
+            true_related = pairs[query]
+            predicted_top10_scores = []
+            for index in top_indices[i]:
+                if corpus[index] in true_related:
+                    predicted_top10_scores.append(1)
+                else:
+                    predicted_top10_scores.append(0)
+            true_top10_score = [1] * len(true_related) + [0] * 10
+            true_top10_score = true_top10_score[:10]
+            predicted_top10_scores = np.array(predicted_top10_scores)
+            true_top10_score = np.array(true_top10_score)
+            dcg = np.sum( (2 ** predicted_top10_scores - 1) / np.log2(np.arange(2, 12)))
+            idcg = np.sum( (2 ** true_top10_score - 1) / np.log2(np.arange(2, 12)))
+            ndcg = dcg / idcg
+            total_score += ndcg
+        score = total_score / len(queries)
     return score
 
 
