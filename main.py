@@ -45,27 +45,27 @@ def load_data(path, batch_size=32):
     train_query, test_query, train_corpus, test_corpus, train_query_id, test_query_id, train_corpus_id, test_corpus_id = train_test_split(
        dataset['query'], dataset['corpus'], dataset['query_id'].tolist(), dataset['corpus_id'].tolist(), test_size=0.2)
 
-    train_dataset = MyDataset({'query': train_query, 'corpus': train_corpus, 'query_id': train_query_id, 'corpus_id': train_corpus_id})
+    train_data = {'query': train_query, 'corpus': train_corpus, 'query_id': train_query_id, 'corpus_id': train_corpus_id}
+    train_dataset = MyDataset(train_data)
     test_query, val_query, test_corpus, val_corpus, test_query_id, val_query_id, test_corpus_id, val_corpus_id = train_test_split(
          test_query, test_corpus, test_query_id, test_corpus_id, test_size=0.5)
     
-    test_dataset = MyDataset({'query': test_query, 'corpus': test_corpus, 'query_id': test_query_id, 'corpus_id': test_corpus_id})
-    val_dataset = MyDataset({'query': val_query, 'corpus': val_corpus, 'query_id': val_query_id, 'corpus_id': val_corpus_id})
-
+    test_data = {'query': test_query, 'corpus': test_corpus, 'query_id': test_query_id, 'corpus_id': test_corpus_id}
+    test_dataset = MyDataset(test_data)
+    val_data = {'query': val_query, 'corpus': val_corpus, 'query_id': val_query_id, 'corpus_id': val_corpus_id}
+    val_dataset = MyDataset(val_data)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    return dataset, positive_samples, train_loader, val_loader, test_loader, query_id_to_index, corpus_id_to_index, train_dataset, val_dataset, test_dataset
+    return dataset, positive_samples, train_loader, val_loader, test_loader, query_id_to_index, corpus_id_to_index, train_data, val_data, test_data
 
-def tokenize_data(data, tokenizer, query_id_to_index, corpus_id_to_index, device):
-    queries = list(set(data['query']))
-    corpus = list(set(data['corpus']))
-    input_texts = prepend_prefix(queries, corpus)
-    embeddings = tokenizer(input_texts, max_length=512, padding=True, truncation=True, return_tensors='pt').to(device)
+def tokenize_data(data, tokenizer, device):
+    embeddings = tokenizer(data, max_length=512, padding=True, truncation=True, return_tensors='pt').to(device)
     return embeddings
     
+
 def generate_negative_samples(batch):
     negative_index = {'negative_q': [], 'negative_c': []}
     positive_index = []
@@ -122,7 +122,8 @@ def train(model, tokenizer, data, train_loader, val_loader, train_data, val_data
         for batch in tqdm(train_loader):
             optimizer.zero_grad()
             positive_index, negative_index, queries, corpuses = generate_negative_samples(batch)
-            inputs = tokenize_data(batch, tokenizer, query_id_to_index, corpus_id_to_index, device)
+            inputs = prepend_prefix(batch)
+            inputs = tokenize_data(inputs, tokenizer, device)
             n_queries = len(queries)
             n_corpuses = len(corpuses)
             inputs_ids = inputs['input_ids']
@@ -166,7 +167,8 @@ def evaluate(model, test_loader, test_data, query_id_to_index, corpus_id_to_inde
     with torch.no_grad():
         for batch in test_loader:
             positive_index, negative_index, queries, corpuses = generate_negative_samples(batch)
-            inputs = tokenize_data(batch, tokenizer, query_id_to_index, corpus_id_to_index, device)
+            inputs = prepend_prefix(batch)
+            inputs = tokenize_data(inputs, tokenizer, device)
             n_queries = len(queries)
             n_corpuses = len(corpuses)
             inputs_ids = inputs['input_ids']
@@ -183,10 +185,20 @@ def evaluate(model, test_loader, test_data, query_id_to_index, corpus_id_to_inde
     return avg_loss, acc
 
 
-def prepend_prefix(queries, corpuses):
+def prepend_prefix(data):
+    queries = list(set(data['query']))
+    corpuses = list(set(data['corpus']))
     queries = ['query: ' + query for query in queries]
     corpus = ['passage: ' + passage for passage in corpuses]
     return queries+corpus
+
+def prepend_prefix_2(data):
+    queries = data['query']
+    corpuses = data['corpus']
+    queries = ['query: ' + query for query in queries]
+    corpus = ['passage: ' + passage for passage in corpuses]
+    return queries+corpus
+
     
     
 def compute_loss(scores_matrix, positive_index, negative_index):
@@ -206,25 +218,40 @@ def compute_loss(scores_matrix, positive_index, negative_index):
     
     
 def accuracy(data, model, tokenizer, query_id_to_index, corpus_id_to_index, device):
+    encode_embeddings = []
+    batch_size = 64
     total_score = 0
-    queries = data['query_id'].unique()
-    n_queries = len(queries)
-    inputs = tokenize_data(data, tokenizer, query_id_to_index, corpus_id_to_index, device)
-    inputs_ids = inputs['input_ids']
-    attention_mask = inputs['attention_mask']
-    outputs = model(inputs_ids)
-    embeddings = average_pool(outputs.last_hidden_state, attention_mask)
-    embeddings = F.normalize(embeddings, p=2, dim=1)
+    query_list = data['query_id']
+    corpus = list(set(data['corpus']))
+    for i in range(0, len(data['query']), batch_size):
+        queries = data['query'][i:i+batch_size]
+        n_queries = len(queries)
+        inputs = prepend_prefix_2({'query': queries, 'corpus': data['corpus'][i:i+batch_size]})
+        inputs = tokenize_data(inputs, tokenizer, device)
+        inputs_ids = inputs['input_ids']
+        attention_mask = inputs['attention_mask']
+        outputs = model(inputs_ids)
+        embeddings = average_pool(outputs.last_hidden_state, attention_mask)
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        encode_embeddings.append(embeddings)
+    embeddings = torch.cat(encode_embeddings, dim=0)
+    assert embeddings.shape[0] == len(queries) + len(corpus)
     scores_matrix = (embeddings[:n_queries] @ embeddings[n_queries:].T) * 100
-    
-    for query in queries:
+        
+    for query in query_list:
         query_index = query_id_to_index[query]
-        predicted_top10_indices = torch.argsort(scores_matrix[query_index], descending=True)[:10]
         df = pd.DataFrame(data)
-        true_related = df[df['query_id'] == query].shape[0]
-        true_top10_score = [1] * true_related + [0] * 10 
+        true_related = df[df['query_id'] == query]
+        predicted_top10_scores = []
+        predicted_top10_indices = torch.argsort(scores_matrix[query_index], descending=True)[:10]
+        for index in predicted_top10_indices:
+            if index in true_related['corpus_id']:
+                predicted_top10_scores.append(1)
+            else:
+                predicted_top10_scores.append(0)
+        true_top10_score = [1] * true_related.shape[0] + [0] * 10 
         true_top10_score = true_top10_score[:10]
-        dcg = np.sum( (2 ** scores_matrix[query_index][predicted_top10_indices] - 1) / np.log2(np.arange(2, 12)))
+        dcg = np.sum( (2 ** predicted_top10_scores - 1) / np.log2(np.arange(2, 12)))
         idcg = np.sum( (2 ** true_top10_score - 1) / np.log2(np.arange(2, 12)))
         ndcg = dcg / idcg
         total_score += ndcg
@@ -267,7 +294,7 @@ if __name__ == '__main__':
     
     epochs = 10
     learning_rate = 1e-4
-    batch_size = 32
+    batch_size = 64
     
     
     
