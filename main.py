@@ -83,27 +83,28 @@ def generate_negative_samples(batch):
         negative_c = []
         query = batch['query_id'][i]
         corpus = batch['corpus_id'][i]
-        unrelated_samples = {'query_id': [], 'corpus_id': []}
-        for j,_ in enumerate(batch):
-            if batch['query_id'][j] != query:
-                unrelated_samples['query_id'].append(batch['query_id'][j])
-            if batch['corpus_id'][j] != corpus:
-                unrelated_samples['corpus_id'].append(batch['corpus_id'][j])
+        # unrelated_samples = {'query_id': [], 'corpus_id': []}
+        # for j,_ in enumerate(batch):
+        #     if batch['query_id'][j] != query:
+        #         unrelated_samples['query_id'].append(batch['query_id'][j])
+        #     if batch['corpus_id'][j] != corpus:
+        #         unrelated_samples['corpus_id'].append(batch['corpus_id'][j])
         for x, q in enumerate(queries):
-            if q != query and q in unrelated_samples['query_id']:
+            # if q != query and q in unrelated_samples['query_id']:
+            if q != query:
                 negative_c.append(x)
             if q == query:
                 index[0] = x
         for y, c in enumerate(corpuses):
-            if  c != corpus and c in unrelated_samples['corpus_id']:
+            # if  c != corpus and c in unrelated_samples['corpus_id']:
+            if c != corpus:
                 negative_q.append(y)
             if  c == corpus:
                 index[1] = y
         positive_index.append(tuple(index))
-        if negative_c == []:
-            negative_index['negative_c'].append(0)
         negative_index['negative_q'].append([(index[0], i) for i in negative_q])
         negative_index['negative_c'].append([(i, index[1]) for i in negative_c])
+        
 
                     
     return positive_index, negative_index, queries, corpuses
@@ -254,10 +255,10 @@ def accuracy(data, model, tokenizer, pairs, device):
             true_top10_score = [1] * len(true_related) + [0] * 10
             true_top10_score = true_top10_score[:10]
             predicted_top10_scores = np.array(predicted_top10_scores)
-            true_top10_score = np.array(true_top10_score)
+            true_top10_score = sorted(predicted_top10_scores, reverse=True)
             dcg = np.sum( (2 ** predicted_top10_scores - 1) / np.log2(np.arange(2, 12)))
             idcg = np.sum( (2 ** true_top10_score - 1) / np.log2(np.arange(2, 12)))
-            ndcg = dcg / idcg
+            ndcg = dcg / idcg if idcg != 0 else 0
             total_score += ndcg
         score = total_score / len(queries)
     return score
@@ -296,10 +297,10 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Current Device: {}".format(device))
     
-    epochs = 10
+    epochs = 100
     learning_rate = 1e-5
     batch_size = 32
-    patience = 10
+    patience = 100
     
     
     data_path = 'Data/'
