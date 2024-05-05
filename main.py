@@ -74,8 +74,8 @@ def tokenize_data(data, tokenizer, device):
 def generate_negative_samples(batch):
     negative_index = {'negative_q': [], 'negative_c': []}
     positive_index = []
-    queries = batch['query_id'].unique()
-    corpuses = batch['corpus_id'].unique()
+    queries = batch['query_id']
+    corpuses = batch['corpus_id']
     
     for i in range(len(batch['query_id'])):
         index = [0, 0]
@@ -104,7 +104,6 @@ def generate_negative_samples(batch):
             negative_index['negative_c'].append(0)
         negative_index['negative_q'].append([(index[0], i) for i in negative_q])
         negative_index['negative_c'].append([(i, index[1]) for i in negative_c])
-        
 
                     
     return positive_index, negative_index, queries, corpuses
@@ -120,6 +119,7 @@ def train(model, tokenizer, data, train_loader, val_loader, train_data, val_data
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     train_loss, train_acc, val_loss, val_acc = [], [], [], []
     best_val_loss = float('inf')
+    no_improvement = 0
     
     for epoch in range(num_epochs):
         model.train()
@@ -136,7 +136,8 @@ def train(model, tokenizer, data, train_loader, val_loader, train_data, val_data
             outputs = model(inputs_ids)
             embeddings = average_pool(outputs.last_hidden_state, attention_mask)
             embeddings = F.normalize(embeddings, p=2, dim=1)
-            scores_matrix = (embeddings[:n_queries] @ embeddings[n_queries:].T) * 100
+            scores_matrix = embeddings[:n_queries] @ embeddings[n_queries:].T
+
             loss = compute_loss(scores_matrix, positive_index, negative_index)
             loss.backward()
             total_loss += loss.item()
@@ -149,8 +150,8 @@ def train(model, tokenizer, data, train_loader, val_loader, train_data, val_data
         v_loss, v_acc = evaluate(model, val_loader, val_data, pairs, device)
         val_loss.append(float(v_loss))
         val_acc.append(float(v_acc))
-        print(f'End of Epoch {epoch}, Training Loss: {avg_loss}, Validation Loss: {v_loss}, Validation Accuracy: {v_acc}')
-
+        print(f'End of Epoch {epoch}, Training Loss: {avg_loss}, Training Accuracy: {t_acc}, Validation Loss: {v_loss}, Validation Accuracy: {v_acc}')
+        
         if v_loss < best_val_loss:
             best_val_loss = v_loss
             no_improvement = 0
@@ -181,7 +182,7 @@ def evaluate(model, test_loader, test_data, pairs, device):
             outputs = model(inputs_ids)
             embeddings = average_pool(outputs.last_hidden_state, attention_mask)
             embeddings = F.normalize(embeddings, p=2, dim=1)
-            scores_matrix = (embeddings[:n_queries] @ embeddings[n_queries:].T) * 100
+            scores_matrix = embeddings[:n_queries] @ embeddings[n_queries:].T
             loss = compute_loss(scores_matrix, positive_index, negative_index)
             test_loss += loss.item()
     avg_loss = test_loss / len(test_loader)
@@ -191,13 +192,6 @@ def evaluate(model, test_loader, test_data, pairs, device):
 
 
 def prepend_prefix(data):
-    queries = list(set(data['query']))
-    corpuses = list(set(data['corpus']))
-    queries = ['query: ' + query for query in queries]
-    corpus = ['passage: ' + passage for passage in corpuses]
-    return queries+corpus
-
-def prepend_prefix_2(data):
     queries = data['query']
     corpuses = data['corpus']
     queries = ['query: ' + query for query in queries]
@@ -210,13 +204,11 @@ def compute_loss(scores_matrix, positive_index, negative_index):
     total_loss = 0
     for pos, neg_q, neg_c in zip(positive_index, negative_index['negative_q'], negative_index['negative_c']):
         q_rows, q_cols = zip(*neg_q)
-    
         loss_q = -torch.log(torch.exp(scores_matrix[pos]) / (torch.exp(scores_matrix[pos]) + torch.sum(torch.exp(scores_matrix[q_rows, q_cols]))))
-        if neg_c == 0:
-            loss_c = 0   
-        else:
-            c_rows, c_cols = zip(*neg_c)
-            loss_c = -torch.log(torch.exp(scores_matrix[pos]) / (torch.exp(scores_matrix[pos]) + torch.sum(torch.exp(scores_matrix[c_rows, c_cols]))))
+
+        c_rows, c_cols = zip(*neg_c)
+        loss_c = -torch.log(torch.exp(scores_matrix[pos]) / (torch.exp(scores_matrix[pos]) + torch.sum(torch.exp(scores_matrix[c_rows, c_cols]))))
+
         total_loss += loss_q + loss_c
     avg_loss = total_loss / len(positive_index)
     return avg_loss
@@ -226,15 +218,15 @@ def accuracy(data, model, tokenizer, pairs, device):
     with torch.no_grad():
         model.eval()
         encode_embeddings = []
-        batch_size = 64
+        batch_size = 32
         total_score = 0
         query_list = data['query_id']
-        corpus = data['corpus']
+        corpus = data['corpus_id']
         n_queries = len(query_list)
         for i in range(0, len(data['query']), batch_size):
             queries = data['query'][i:i+batch_size]
             
-            inputs = prepend_prefix_2({'query': queries, 'corpus': data['corpus'][i:i+batch_size]})
+            inputs = prepend_prefix({'query': queries, 'corpus': data['corpus'][i:i+batch_size]})
             inputs = tokenize_data(inputs, tokenizer, device)
             inputs_ids = inputs['input_ids']
             attention_mask = inputs['attention_mask']
@@ -245,7 +237,8 @@ def accuracy(data, model, tokenizer, pairs, device):
                 encode_embeddings.append(embeddings)
 
         embeddings = torch.cat(encode_embeddings, dim=0)
-        scores_matrix = (embeddings[:n_queries] @ embeddings[n_queries:].T) * 100
+        scores_matrix = embeddings[:n_queries] @ embeddings[n_queries:].T
+  
         
         top_scores, top_indices = torch.topk(scores_matrix, 10, dim=1, largest=True, sorted=True)
  
@@ -304,9 +297,9 @@ if __name__ == '__main__':
     print("Current Device: {}".format(device))
     
     epochs = 10
-    learning_rate = 1e-4
-    batch_size = 64
-    
+    learning_rate = 1e-5
+    batch_size = 32
+    patience = 10
     
     
     data_path = 'Data/'
@@ -319,7 +312,7 @@ if __name__ == '__main__':
     
     print("Starting Training")
     
-    train_loss, train_acc, val_loss, val_acc = train(model, tokenizer, dataset, train_loader, val_loader, train_data, val_data, epochs, learning_rate, 10, pairs, device)
+    train_loss, train_acc, val_loss, val_acc = train(model, tokenizer, dataset, train_loader, val_loader, train_data, val_data, epochs, learning_rate, patience, pairs, device)
     
     plot_loss(train_loss, train_acc, val_loss, val_acc)
     
